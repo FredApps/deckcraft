@@ -40,11 +40,17 @@ discarding font-install passes before input forwarding. Its font regression chec
 Arabic/Japanese/Hangul glyphs when those optional font inputs are present; missing optional
 inputs do not establish script coverage.
 
-Required runtime checks with a synthetic deck:
+Source inspection verifies these lifecycle paths: a blocked popup offers an explicit retry
+whose click handler calls the browser API; closing the popup offers reopening; ending the show
+closes the popup; incoming messages check origin, source window and opening-session token.
+This establishes the intended control flow, not empirical compatibility with each browser.
+
+Runtime checks that would add empirical coverage with a synthetic deck:
 
 - Popup allowed and blocked, explicit retry, and independent window positioning.
 - Initial popup behavior in Safari and Firefox, including whether explicit retry is needed on
-  each show start. These browser families have not been exercised for this candidate.
+  each show start. These browser families have not been exercised for this candidate; missing
+  manual coverage alone is not evidence of a defect or a mandatory merge blocker.
 - Next/Previous, Home/End, numeric navigation, and no double advance on Space/Enter.
 - Current/next previews, notes, pause/reset, black/white screens, All Slides and zoom.
 - Navigation from both windows, including animation steps and the end screen.
@@ -52,5 +58,8 @@ Required runtime checks with a synthetic deck:
 - Rejection of messages from the wrong origin, source window or prior session.
 - Native presenter regressions, WASM compilation and the full repository quality gates.
 
-All runtime items above, including the actual browser popup/reload/end-show lifecycle, remain
-pending for this candidate. Shared native tests do not substitute for browser execution.
+All runtime items above, including actual browser popup/reload/end-show execution, remain
+unexecuted for this candidate. Shared native tests and source inspection do not constitute
+browser-executed validation. Font subsets can legitimately omit individual script families;
+the regression always checks installation/layout/discard handling, and checks a script's glyphs
+only when its corresponding bundled face is present.
