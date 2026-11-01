@@ -54,6 +54,40 @@ pub struct Snapshot {
     pub current: Option<Preview>,
     pub next: Option<Preview>,
 }
+
+/// Images acknowledged by a successful transport send, never merely attempted images.
+#[derive(Default)]
+pub struct DeltaCache {
+    current: Option<Preview>,
+    next: Option<Preview>,
+    token: String,
+}
+impl DeltaCache {
+    pub fn send<E>(
+        &mut self,
+        mut snapshot: Snapshot,
+        token: &str,
+        refresh: bool,
+        send: impl FnOnce(Snapshot, bool, bool) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let fresh = refresh || self.token != token;
+        let current_changed = fresh || self.current != snapshot.current;
+        let next_changed = fresh || self.next != snapshot.next;
+        let current = snapshot.current.clone();
+        let next = snapshot.next.clone();
+        if !current_changed {
+            snapshot.current = None;
+        }
+        if !next_changed {
+            snapshot.next = None;
+        }
+        send(snapshot, current_changed, next_changed)?;
+        self.current = current;
+        self.next = next;
+        self.token = token.to_owned();
+        Ok(())
+    }
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Command {
     Key { name: String, command: bool, shift: bool, alt: bool, ctrl: bool },
@@ -72,13 +106,39 @@ pub trait Host {
 /// The popup's independent egui renderer. It never advances a local show clock.
 #[derive(Default)]
 pub struct View {
+    fonts: crate::uifonts::UiFonts,
+    styled: bool,
     current: Option<egui::TextureHandle>,
     next: Option<egui::TextureHandle>,
     previous_current: Option<Preview>,
     previous_next: Option<Preview>,
 }
 impl View {
+    /// Install the same interface and dynamic fallback fonts as SlideApp before layout.
+    /// Font definitions take effect on the next pass; never forward input on a discarded pass.
+    pub fn prepare(&mut self, ctx: &egui::Context, notes: &str) -> bool {
+        if !self.styled {
+            crate::theme::install_fonts_with(ctx, &self.fonts.faces);
+            crate::theme::apply(ctx, &crate::theme::Tokens::dark());
+            self.styled = true;
+            ctx.request_discard("install presenter interface fonts before layout");
+            return false;
+        }
+        if ctx.will_discard() {
+            return false;
+        }
+        self.fonts.note(ctx, notes);
+        if self.fonts.apply(ctx) {
+            ctx.request_discard("install presenter note fallback fonts before layout");
+            return false;
+        }
+        true
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) -> Vec<Command> {
+        if !self.prepare(ui.ctx(), &snapshot.notes) {
+            return Vec::new();
+        }
         let mut commands = Vec::new();
         let keys = ui.input(|i| {
             i.events
@@ -207,6 +267,143 @@ fn fit_preview(size: egui::Vec2, width: f32, height: f32) -> egui::Vec2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot() -> Snapshot {
+        Snapshot {
+            slide: 0,
+            total: 2,
+            ended: false,
+            notes: String::new(),
+            elapsed: "00:00:00".into(),
+            paused: false,
+            notes_px: 18.0,
+            blank: None,
+            grid: false,
+            zoom_armed: false,
+            current: Some(Preview { width: 1, height: 1, rgba: vec![255; 4] }),
+            next: Some(Preview { width: 1, height: 1, rgba: vec![0; 4] }),
+        }
+    }
+
+    #[test]
+    fn failed_transport_retries_images_and_only_success_deduplicates() {
+        let mut cache = DeltaCache::default();
+        let first = snapshot();
+        let failed = cache.send(first.clone(), "session", false, |delta, current, next| {
+            assert!(current && next);
+            assert_eq!(delta.current, first.current);
+            assert_eq!(delta.next, first.next);
+            Err("serialization or postMessage failed")
+        });
+        assert!(failed.is_err());
+        let sent = cache.send(first.clone(), "session", false, |delta, current, next| {
+            assert!(current && next, "a failed initial send must not suppress either image");
+            assert_eq!(delta.current, first.current);
+            assert_eq!(delta.next, first.next);
+            Ok::<_, ()>(())
+        });
+        assert!(sent.is_ok());
+        let sent = cache.send(first.clone(), "session", false, |delta, current, next| {
+            assert!(!current && !next);
+            assert!(delta.current.is_none() && delta.next.is_none());
+            Ok::<_, ()>(())
+        });
+        assert!(sent.is_ok());
+        let mut changed = first.clone();
+        changed.current.as_mut().unwrap().rgba = vec![42; 4];
+        let failed = cache.send(changed.clone(), "session", false, |_, current, next| {
+            assert!(current && !next);
+            Err(())
+        });
+        assert!(failed.is_err());
+        let sent = cache.send(changed.clone(), "session", false, |delta, current, next| {
+            assert!(current && !next, "unchanged retry after a failed changed-image send");
+            assert_eq!(delta.current, changed.current);
+            Ok::<_, ()>(())
+        });
+        assert!(sent.is_ok());
+    }
+
+    #[test]
+    fn transport_refreshes_new_sessions_reloads_and_clears_previews() {
+        let mut cache = DeltaCache::default();
+        for (token, refresh) in [("first", false), ("second", false), ("second", true)] {
+            let sent = cache.send(snapshot(), token, refresh, |delta, current, next| {
+                assert!(current && next);
+                assert!(delta.current.is_some() && delta.next.is_some());
+                Ok::<_, ()>(())
+            });
+            assert!(sent.is_ok());
+        }
+        let failed = cache.send(snapshot(), "second", true, |_, current, next| {
+            assert!(current && next);
+            Err(())
+        });
+        // BrowserHost retains refresh_images after failure, even when the token is unchanged.
+        let refresh_images = failed.is_err();
+        let sent = cache.send(snapshot(), "second", refresh_images, |_, current, next| {
+            assert!(current && next, "reload refresh must survive a failed send");
+            Ok::<_, ()>(())
+        });
+        assert!(sent.is_ok());
+        let mut cleared = snapshot();
+        cleared.current = None;
+        cleared.next = None;
+        let failed = cache.send(cleared.clone(), "second", false, |_, current, next| {
+            assert!(current && next);
+            Err(())
+        });
+        assert!(failed.is_err());
+        let sent = cache.send(cleared.clone(), "second", false, |delta, current, next| {
+            assert!(current && next, "clearing images is retried too");
+            assert!(delta.current.is_none() && delta.next.is_none());
+            Ok::<_, ()>(())
+        });
+        assert!(sent.is_ok());
+        let sent = cache.send(cleared, "second", false, |_, current, next| {
+            assert!(!current && !next);
+            Ok::<_, ()>(())
+        });
+        assert!(sent.is_ok());
+    }
+
+    #[test]
+    fn popup_installs_interface_fonts_before_non_latin_note_layout() {
+        let ctx = egui::Context::default();
+        let mut view = View::default();
+        let mut data = snapshot();
+        let arabic = "\u{645}\u{631}\u{62d}\u{628}\u{627}";
+        let japanese = "\u{65e5}\u{672c}\u{8a9e}";
+        let korean = "\u{d55c}\u{ae00}";
+        data.notes = format!("{arabic} {japanese} {korean}");
+        let mut installing = 0;
+        let mut layouts = 0;
+        for _ in 0..4 {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                if !view.prepare(ui.ctx(), &data.notes) {
+                    installing += 1;
+                    assert!(view.ui(ui, &data).is_empty(), "no commands during a discarded font-install pass");
+                    return;
+                }
+                assert!(!ui.ctx().will_discard());
+                layouts += 1;
+                for (family, text) in [("Noto Sans Arabic", arabic), ("BIZ UDPGothic", japanese), ("NanumGothic", korean)] {
+                    if deckcraft_fonts::CRAFT_FONTS.iter().any(|face| face.family == family) {
+                        ui.ctx().fonts_mut(|fonts| {
+                            for c in text.chars() {
+                                assert!(fonts.has_glyph(&egui::FontId::proportional(18.0), c), "missing bundled {family} glyph {c:?}");
+                            }
+                        });
+                    } else {
+                        assert!(option_env!("CRAFT_FONTS_REQUIRED").is_none(), "required font input lacks {family}");
+                    }
+                }
+                let _ = view.ui(ui, &data);
+            });
+            output.textures_delta.clear();
+        }
+        assert!(installing > 0 && layouts > 0, "font installation must precede an actual notes layout");
+    }
     #[test]
     fn popup_input_is_forwarded_once_without_advancing_its_own_state() {
         use egui_kittest::kittest::Queryable;

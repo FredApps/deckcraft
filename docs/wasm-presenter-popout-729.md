@@ -26,16 +26,31 @@ other contributors' unmerged presenter work is included.
 
 ## Validation
 
-Candidate implementation; not yet qualified for release. Compilation and automated tests are
-pending. The original bug was reproduced on the deployed 0.7.0 browser build on 2026-10-14;
-that deployment's exact commit is unknown.
+Candidate implementation; not yet qualified for release. The current-main reconciliation and
+transport/font corrections have had source inspection and static diff checks only. No local Rust
+builds, tests or formatter were run for this candidate; hosted compilation and regression tests
+remain pending. Earlier-head validation recorded in the PR does not qualify this changed tree.
+The original bug was reproduced on the deployed 0.7.0 browser build on 2026-10-14; that
+deployment's exact commit is unknown.
+
+Regression coverage submitted for hosted execution checks successful image deduplication,
+failed-send retries, session/reload refresh and clearing previews. The independent popup uses
+the existing interface font definitions and UiFonts fallback discovery before laying out notes,
+discarding font-install passes before input forwarding. Its font regression checks bundled
+Arabic/Japanese/Hangul glyphs when those optional font inputs are present; missing optional
+inputs do not establish script coverage.
 
 Required runtime checks with a synthetic deck:
 
 - Popup allowed and blocked, explicit retry, and independent window positioning.
+- Initial popup behavior in Safari and Firefox, including whether explicit retry is needed on
+  each show start. These browser families have not been exercised for this candidate.
 - Next/Previous, Home/End, numeric navigation, and no double advance on Space/Enter.
 - Current/next previews, notes, pause/reset, black/white screens, All Slides and zoom.
 - Navigation from both windows, including animation steps and the end screen.
 - Close/reopen the presenter, reload it, end/restart the show, and close/reload the audience.
 - Rejection of messages from the wrong origin, source window or prior session.
 - Native presenter regressions, WASM compilation and the full repository quality gates.
+
+All runtime items above, including the actual browser popup/reload/end-show lifecycle, remain
+pending for this candidate. Shared native tests do not substitute for browser execution.

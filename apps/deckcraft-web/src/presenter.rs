@@ -1,5 +1,5 @@
 //! Same-origin popup transport. Each window starts its own eframe/WASM runner.
-use deckcraft_ui_egui::presenter::{Command, Host, Snapshot, View};
+use deckcraft_ui_egui::presenter::{Command, DeltaCache, Host, Snapshot, View};
 use std::{
     cell::RefCell,
     collections::VecDeque,
@@ -43,9 +43,7 @@ pub struct BrowserHost {
     origin: String,
     listener: Closure<dyn FnMut(web_sys::MessageEvent)>,
     button: Option<(web_sys::HtmlElement, Closure<dyn FnMut(web_sys::Event)>)>,
-    last_current: Option<deckcraft_ui_egui::presenter::Preview>,
-    last_next: Option<deckcraft_ui_egui::presenter::Preview>,
-    image_token: String,
+    images: DeltaCache,
 }
 impl BrowserHost {
     pub fn new(ctx: egui::Context) -> Result<Self, String> {
@@ -81,7 +79,7 @@ impl BrowserHost {
             ctx.request_repaint();
         });
         window.add_event_listener_with_callback("message", listener.as_ref().unchecked_ref()).map_err(error)?;
-        Ok(Self { state, origin, listener, button: None, last_current: None, last_next: None, image_token: String::new() })
+        Ok(Self { state, origin, listener, button: None, images: DeltaCache::default() })
     }
     fn remove_button(&mut self) {
         if let Some((button, callback)) = self.button.take() {
@@ -172,26 +170,18 @@ impl Host for BrowserHost {
             return;
         }
         if let Some(popup) = state.popup.clone() {
-            let fresh = state.refresh_images || self.image_token != state.token;
-            state.refresh_images = false;
-            let current_changed = fresh || self.last_current != snapshot.current;
-            let next_changed = fresh || self.last_next != snapshot.next;
-            self.last_current = snapshot.current.clone();
-            self.last_next = snapshot.next.clone();
-            self.image_token = state.token.clone();
-            let mut delta = snapshot;
-            if !current_changed {
-                delta.current = None;
+            let token = state.token.clone();
+            let sent = self.images.send(snapshot, &token, state.refresh_images, |delta, current_changed, next_changed| {
+                send(
+                    &popup,
+                    &self.origin,
+                    serde_json::json!({"kind":"snapshot", "token":token, "snapshot":delta,
+                    "currentChanged":current_changed, "nextChanged":next_changed}),
+                )
+            });
+            if sent.is_ok() {
+                state.refresh_images = false;
             }
-            if !next_changed {
-                delta.next = None;
-            }
-            let _ = send(
-                &popup,
-                &self.origin,
-                serde_json::json!({"kind":"snapshot", "token":state.token, "snapshot":delta,
-                "currentChanged":current_changed, "nextChanged":next_changed}),
-            );
         }
     }
     fn close(&mut self) {
@@ -278,7 +268,11 @@ impl Popup {
 }
 impl eframe::App for Popup {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        ui.ctx().set_visuals(egui::Visuals::dark());
+        let snapshot = self.snapshot.borrow();
+        let notes = snapshot.as_ref().map_or("", |snapshot| snapshot.notes.as_str());
+        if !self.view.prepare(ui.ctx(), notes) {
+            return;
+        }
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
         if self.opener.closed().unwrap_or(true) {
             ui.heading("The audience window has closed.");
@@ -289,10 +283,9 @@ impl eframe::App for Popup {
             ui.label("Return to the audience window to resume the connection.");
             return;
         }
-        let snapshot = self.snapshot.borrow().clone();
         egui::CentralPanel::default().show(ui, |ui| {
-            if let Some(snapshot) = snapshot {
-                for command in self.view.ui(ui, &snapshot) {
+            if let Some(snapshot) = snapshot.as_ref() {
+                for command in self.view.ui(ui, snapshot) {
                     let _ = send(&self.opener, &self.origin, serde_json::json!({"kind":"command","token":self.token,"command":command}));
                 }
             } else {
